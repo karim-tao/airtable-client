@@ -1,0 +1,92 @@
+<?php
+
+use Airtable\Client\Auth\AirtableCredentials;
+use Airtable\Client\Auth\Grants\AuthorizationCodeGrant;
+use Airtable\Client\Auth\Grants\Grant;
+use Airtable\Client\Auth\Token;
+use Airtable\Client\Auth\TokenManager;
+use Airtable\Client\Events\TokenRefreshed;
+use Airtable\Client\Exceptions\AirtableAuthenticationException;
+use Airtable\Client\Http\Transporter;
+use Airtable\Client\Tests\Support\EventRecorder;
+use Airtable\Client\Tests\Support\FakeHttpClient;
+use Nyholm\Psr7\Factory\Psr17Factory;
+
+function tokenManager(FakeHttpClient $http, ?Grant $grant = null, ?Token $token = null, ?EventRecorder $events = null): TokenManager
+{
+    $factory = new Psr17Factory;
+
+    return new TokenManager(
+        new AirtableCredentials('client-id', 'client-secret'),
+        new Transporter($http, $factory, $factory, $factory, 'https://api.airtable.com'),
+        'https://airtable.com/oauth2/v1/token',
+        $grant,
+        $token,
+        $events,
+    );
+}
+
+test('ensure exchanges the authorization code and the verifier with http basic auth', function () {
+    $http = new FakeHttpClient([tokenResponse()]);
+
+    $token = tokenManager($http, grant: new AuthorizationCodeGrant('the-code', 'https://app.test/callback', 'the-verifier'))->ensure();
+
+    $request = $http->requests[0];
+
+    expect($token->accessToken())->toBe('new-access')
+        ->and((string) $request->getUri())->toBe('https://airtable.com/oauth2/v1/token')
+        ->and($request->getHeaderLine('Authorization'))->toBe('Basic ' . base64_encode('client-id:client-secret'))
+        ->and((string) $request->getBody())->toBe('grant_type=authorization_code&code=the-code&redirect_uri=https%3A%2F%2Fapp.test%2Fcallback&code_verifier=the-verifier');
+});
+
+test('ensure returns a stored token while it is valid', function () {
+    $http = new FakeHttpClient([]);
+    $token = Token::fromValues('stored', time() + 3600, 'stored-refresh');
+
+    expect(tokenManager($http, token: $token)->ensure())->toBe($token)
+        ->and($http->requests)->toBe([]);
+});
+
+test('ensure refreshes an expired token and keeps the new pair', function () {
+    $http = new FakeHttpClient([tokenResponse()]);
+    $manager = tokenManager($http, token: Token::fromValues('stale', time() - 10, 'old-refresh'));
+
+    $token = $manager->ensure();
+
+    expect($token->accessToken())->toBe('new-access')
+        ->and($token->refreshToken())->toBe('new-refresh')
+        ->and($manager->current())->toBe($token)
+        ->and((string) $http->requests[0]->getBody())->toBe('grant_type=refresh_token&refresh_token=old-refresh');
+});
+
+test('refresh without a token authenticates with the grant', function () {
+    $http = new FakeHttpClient([tokenResponse()]);
+
+    $token = tokenManager($http, grant: new AuthorizationCodeGrant('the-code', 'https://app.test/callback', 'the-verifier'))->refresh();
+
+    expect($token->accessToken())->toBe('new-access');
+});
+
+test('ensure authenticates again when an expired token has no refresh token', function () {
+    $http = new FakeHttpClient([tokenResponse()]);
+
+    $token = tokenManager($http, grant: new AuthorizationCodeGrant('the-code', 'https://app.test/callback', 'the-verifier'), token: Token::fromValues('stale', time() - 10))->ensure();
+
+    expect($token->accessToken())->toBe('new-access')
+        ->and((string) $http->requests[0]->getBody())->toContain('grant_type=authorization_code');
+});
+
+test('ensure fails without a grant or a token', function () {
+    expect(fn () => tokenManager(new FakeHttpClient([]))->ensure())
+        ->toThrow(AirtableAuthenticationException::class, 'no grant configured');
+});
+
+test('it dispatches every token it obtains', function () {
+    $events = new EventRecorder;
+
+    tokenManager(new FakeHttpClient([tokenResponse()]), token: Token::fromValues('stale', time() - 10, 'old-refresh'), events: $events)->ensure();
+
+    expect($events->events)->toHaveCount(1)
+        ->and($events->events[0])->toBeInstanceOf(TokenRefreshed::class)
+        ->and($events->events[0]->token->refreshToken())->toBe('new-refresh');
+});
